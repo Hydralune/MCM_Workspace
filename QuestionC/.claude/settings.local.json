@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(/C:\\Users\\Ylon\\Desktop\\数学建模\\QuestionC/**)",
+      "Read(/C:\\Users\\Ylon\\Desktop\\数学建模\\QuestionC/**)",
+      "Read(/C:\\Users\\Ylon\\Desktop\\数学建模\\QuestionC\\问题1/**)",
+      "Read(/C:\\Users\\Ylon\\Desktop\\数学建模\\QuestionC/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
