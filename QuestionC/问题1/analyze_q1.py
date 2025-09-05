@@ -14,10 +14,13 @@ import seaborn as sns
 def get_project_paths() -> Tuple[str, str, str]:
     """
     Return (project_root, data_path, output_dir)
+    优先使用 数据预处理/male_cleaned.csv；若不存在则回退到 问题1/q1_male_cleaned.csv。
     """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, os.pardir))
-    data_path = os.path.join(current_dir, "q1_male_cleaned.csv")
+    preferred_path = os.path.join(project_root, "数据预处理", "male_cleaned.csv")
+    fallback_path = os.path.join(current_dir, "q1_male_cleaned.csv")
+    data_path = preferred_path if os.path.exists(preferred_path) else fallback_path
     output_dir = os.path.join(current_dir, "figures")
     os.makedirs(output_dir, exist_ok=True)
     return project_root, data_path, output_dir
@@ -182,24 +185,55 @@ def plot_box_by_bmi_group(df: pd.DataFrame, out_dir: str) -> None:
     plt.close()
 
 
-def compute_correlations(df: pd.DataFrame) -> pd.DataFrame:
+def compute_correlations_basic(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["gestational_week", "bmi", "y_concentration"]
+    cols = [c for c in cols if c in df.columns]
     corr = df[cols].corr(method="pearson")
     return corr
 
 
-def save_corr_heatmap(corr: pd.DataFrame, out_dir: str) -> None:
-    plt.figure(figsize=(4.2, 3.6))
+def _select_extended_numeric_columns(df: pd.DataFrame) -> list:
+    """选择用于扩展相关性的数值列（若存在）。"""
+    candidates = [
+        "gestational_week",
+        "bmi",
+        "y_concentration",
+        "y_zscore",
+        "maternal_age",
+        "maternal_height_cm",
+        "maternal_weight_kg",
+        "bmi_recalc",
+        "ivf_flag",
+        # 质控/测序相关
+        "L", "M", "N", "O", "P", "X", "Y", "Z", "AA",
+        # 其他可能存在的辅助列
+        "draw_index",
+    ]
+    cols = [c for c in candidates if c in df.columns]
+    return cols
+
+
+def compute_correlations_extended(df: pd.DataFrame) -> pd.DataFrame:
+    cols = _select_extended_numeric_columns(df)
+    if not cols:
+        return pd.DataFrame()
+    corr = df[cols].apply(pd.to_numeric, errors="coerce").corr(method="pearson")
+    return corr
+
+
+def save_corr_heatmap(corr: pd.DataFrame, out_path_png: str, title: str, figsize=(4.2, 3.6)) -> None:
+    if corr.empty:
+        return
+    plt.figure(figsize=figsize)
     sns.heatmap(corr, annot=True, fmt=".2f", cmap="vlag", vmin=-1, vmax=1, square=True, cbar=True)
-    plt.title("Pearson Correlations")
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "corr_heatmap.png"), dpi=180)
+    plt.savefig(out_path_png, dpi=180)
     plt.close()
 
 
-def write_summary_markdown(df: pd.DataFrame, corr: pd.DataFrame, out_path: str) -> None:
+def write_summary_markdown(df: pd.DataFrame, corr_basic: pd.DataFrame, corr_ext: pd.DataFrame, out_path: str) -> None:
     desc = df[["gestational_week", "bmi", "y_concentration"]].describe().T
-    # Build markdown
     lines = []
     lines.append("# 问题1 EDA 摘要\n")
     lines.append("## 样本规模\n")
@@ -207,14 +241,20 @@ def write_summary_markdown(df: pd.DataFrame, corr: pd.DataFrame, out_path: str) 
     lines.append("\n## 描述性统计（关键变量）\n")
     for idx, row in desc.iterrows():
         lines.append(f"- {idx}: count={int(row['count'])}, mean={row['mean']:.3f}, std={row['std']:.3f}, min={row['min']:.3f}, 25%={row['25%']:.3f}, 50%={row['50%']:.3f}, 75%={row['75%']:.3f}, max={row['max']:.3f}")
-    lines.append("\n## 相关性 (Pearson)\n")
-    for r in corr.index:
-        vals = ", ".join([f"{c}={corr.loc[r, c]:.3f}" for c in corr.columns])
+    lines.append("\n## 基础相关性 (Pearson)\n")
+    for r in corr_basic.index:
+        vals = ", ".join([f"{c}={corr_basic.loc[r, c]:.3f}" for c in corr_basic.columns])
         lines.append(f"- {r}: {vals}")
+    if not corr_ext.empty and "y_concentration" in corr_ext.columns:
+        lines.append("\n## 扩展相关性与Top相关（对 y_concentration）\n")
+        s = corr_ext["y_concentration"].drop("y_concentration", errors="ignore")
+        s = s.sort_values(key=lambda x: x.abs(), ascending=False)
+        topk = s.head(10)
+        for name, val in topk.items():
+            lines.append(f"- {name}: r={val:.3f}")
+        lines.append("\n详见: figures/corr_matrix_extended.csv 与 figures/corr_heatmap_extended.png\n")
     lines.append("\n## 生成图表\n")
-    lines.append("- figures/distributions.png\n- figures/scatter_week_vs_y.png\n- figures/scatter_bmi_vs_y.png\n- figures/box_y_by_bmi_group.png\n- figures/corr_heatmap.png\n")
-    with open(out_path, "w", encoding="utf-8"):
-        pass
+    lines.append("- figures/distributions.png\n- figures/scatter_week_vs_y.png\n- figures/scatter_bmi_vs_y.png\n- figures/box_y_by_bmi_group.png\n- figures/corr_heatmap_basic.png\n- figures/corr_heatmap_extended.png\n")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
@@ -231,10 +271,22 @@ def main() -> None:
     plot_box_by_bmi_group(df, out_dir)
 
     # Correlations and summary
-    corr = compute_correlations(df)
-    save_corr_heatmap(corr, out_dir)
+    corr_basic = compute_correlations_basic(df)
+    save_corr_heatmap(corr_basic, os.path.join(out_dir, "corr_heatmap_basic.png"), "Pearson Correlations (basic)")
+
+    corr_ext = compute_correlations_extended(df)
+    # 保存扩展相关矩阵 CSV
+    if not corr_ext.empty:
+        corr_csv = os.path.join(out_dir, "corr_matrix_extended.csv")
+        corr_ext.to_csv(corr_csv, encoding="utf-8-sig")
+        # 根据维度自适应图尺寸
+        n = corr_ext.shape[0]
+        fig_w = max(4.5, min(1.0 * n, 18.0))
+        fig_h = max(4.0, min(1.0 * n, 18.0))
+        save_corr_heatmap(corr_ext, os.path.join(out_dir, "corr_heatmap_extended.png"), "Pearson Correlations (extended)", figsize=(fig_w, fig_h))
+
     summary_md = os.path.join(os.path.dirname(data_path), "q1_eda_summary.md")
-    write_summary_markdown(df, corr, summary_md)
+    write_summary_markdown(df, corr_basic, corr_ext, summary_md)
     print(f"EDA 完成。图表输出目录: {out_dir}")
     print(f"摘要: {summary_md}")
 

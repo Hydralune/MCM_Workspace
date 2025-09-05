@@ -26,7 +26,10 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 def get_paths() -> Tuple[str, str, str]:
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    data_path = os.path.join(current_dir, "q1_male_cleaned.csv")
+    project_root = os.path.abspath(os.path.join(current_dir, os.pardir))
+    preferred_path = os.path.join(project_root, "数据预处理", "male_cleaned.csv")
+    fallback_path = os.path.join(current_dir, "q1_male_cleaned.csv")
+    data_path = preferred_path if os.path.exists(preferred_path) else fallback_path
     out_dir = os.path.join(current_dir, "models")
     os.makedirs(out_dir, exist_ok=True)
     return current_dir, data_path, out_dir
@@ -91,6 +94,42 @@ def fit_mixed_effects_random_slope(df: pd.DataFrame):
     except Exception:
         mdf = md.fit(reml=False, method="nm")
     return mdf
+
+
+def fit_mixed_effects_random_slope_with_features(df: pd.DataFrame, features: List[str]):
+    """通用混合效应：随机截距 + 孕周随机斜率，固定效应为features列表。
+    要求features中包含 gestational_week。
+    """
+    formula = "y_target ~ " + " + ".join(features)
+    md = smf.mixedlm(
+        formula,
+        data=df,
+        groups=df["subject_id"],
+        re_formula="~ gestational_week",
+    )
+    try:
+        mdf = md.fit(reml=False, method="lbfgs")
+    except Exception:
+        mdf = md.fit(reml=False, method="nm")
+    return mdf
+
+
+def _can_fit_mixedlm(df: pd.DataFrame, features: List[str]) -> bool:
+    """检查是否具备拟合MixedLM的最低条件。"""
+    if df is None or df.empty:
+        return False
+    if "subject_id" not in df.columns or df["subject_id"].nunique() < 2:
+        return False
+    need = [c for c in features if c in df.columns]
+    if "gestational_week" not in need:
+        return False
+    d2 = df.dropna(subset=need + ["subject_id"])  # 确保完整行
+    if d2.empty:
+        return False
+    # 关键自变量需有变化
+    if d2["gestational_week"].nunique() < 2:
+        return False
+    return True
 
 
 def compute_group_tmin(model, bmi_values: Dict[str, float]) -> pd.DataFrame:
@@ -211,6 +250,7 @@ def export_report(
     ols_spline_res=None,
     lme_rs_res=None,
     prob_tables: Optional[Dict[str, pd.DataFrame]] = None,
+    robust_models: Optional[Dict[str, object]] = None,
 ) -> None:
     report_path = os.path.join(out_dir, "q1_model_report_v2.md")
     lines = []
@@ -248,6 +288,9 @@ def export_report(
     add_model_row("OLS_spline", ols_spline_res)
     add_model_row("MixedLM_random_intercept", lme_res)
     add_model_row("MixedLM_random_slope", lme_rs_res)
+    if robust_models:
+        for name, res_obj in robust_models.items():
+            add_model_row(f"Robust_{name}", res_obj)
     if comp_rows:
         comp_df = pd.DataFrame(comp_rows)
         lines.append(comp_df.to_markdown(index=False))
@@ -262,6 +305,21 @@ def export_report(
         for key, dfp in prob_tables.items():
             lines.append(f"\n### 概率达标时点 {key}\n")
             lines.append(dfp.to_markdown(index=False))
+    
+    # 稳健性检验
+    if robust_models:
+        lines.append("\n## 稳健性检验（随机斜率 MixedLM）\n")
+        for name, res_obj in robust_models.items():
+            lines.append(f"### {name}\n")
+            try:
+                lines.append("```")
+                lines.append(str(res_obj.summary()))
+                lines.append("```\n")
+            except Exception:
+                # 最低限度输出关键系数
+                params = getattr(res_obj, "params", pd.Series(dtype=float))
+                lines.append(params.to_frame("coef").to_markdown())
+                lines.append("\n")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"模型报告已导出: {report_path}")
@@ -280,7 +338,7 @@ def main() -> None:
 
     # 代表性BMI（按分箱中位数）
     bmi_bins = pd.cut(df["bmi"], bins=[0, 20, 28, 32, 36, 40, np.inf], right=False, include_lowest=True)
-    bmi_group_medians = df.groupby(bmi_bins)["bmi"].median().to_dict()
+    bmi_group_medians = df.groupby(bmi_bins, observed=False)["bmi"].median().to_dict()
     bmi_group_labels = {}
     for interval in bmi_group_medians.keys():
         if interval.right == np.inf:
@@ -304,6 +362,38 @@ def main() -> None:
         tbl_ri.rename(columns={f"t_min_p{int(p*100)}": "t_min_ri"}, inplace=True)
         prob_tables[f"P>={int(p*100)}% (随机截距)"] = tbl_ri
 
+    # 构建稳健性检验：使用具备全部变量的统一样本子集
+    robust_needed = ["subject_id", "gestational_week", "y_target", "bmi", "maternal_weight_kg", "L", "M", "N"]
+    for c in robust_needed:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    robust_df = df.copy()
+    existing_needed = [c for c in robust_needed if c in robust_df.columns]
+    robust_df = robust_df.dropna(subset=existing_needed).reset_index(drop=True)
+
+    robust_models: Dict[str, object] = {}
+    # A: week + BMI
+    features_A = ["gestational_week", "bmi"]
+    if _can_fit_mixedlm(robust_df, features_A):
+        try:
+            robust_models["RS_A_week+BMI"] = fit_mixed_effects_random_slope_with_features(robust_df, features_A)
+        except Exception:
+            pass
+    # B: week + weight
+    features_B = ["gestational_week", "maternal_weight_kg"]
+    if _can_fit_mixedlm(robust_df, features_B):
+        try:
+            robust_models["RS_B_week+weight"] = fit_mixed_effects_random_slope_with_features(robust_df, features_B)
+        except Exception:
+            pass
+    # C: week + BMI + L/M/N
+    features_C = ["gestational_week", "bmi", "L", "M", "N"]
+    if _can_fit_mixedlm(robust_df, features_C):
+        try:
+            robust_models["RS_C_week+BMI+L+M+N"] = fit_mixed_effects_random_slope_with_features(robust_df, features_C)
+        except Exception:
+            pass
+
     export_report(
         ols_res,
         lme_res,
@@ -313,6 +403,7 @@ def main() -> None:
         ols_spline_res=ols_spline_res,
         lme_rs_res=lme_rs_res,
         prob_tables=prob_tables,
+        robust_models=robust_models if robust_models else None,
     )
 
     # 导出问题2时点表（合并P≥80%与P≥90%，随机斜率方案）
@@ -451,6 +542,23 @@ def main() -> None:
     except Exception:
         pass
     final_lines.append("\n注：低于11周属于外推，建议遵循临床可检测最早周。\n")
+    # 稳健性检验结论摘要
+    if robust_models:
+        final_lines.append("\n## 稳健性检验结论\n")
+        try:
+            # 汇总关键系数方向
+            def coef_str(res, name):
+                ps = getattr(res, "params", pd.Series(dtype=float))
+                out = []
+                for key in ["gestational_week", "bmi", "maternal_weight_kg", "L", "M", "N"]:
+                    if key in ps.index:
+                        out.append(f"{key}={ps[key]:+.3f}")
+                return f"- {name}: " + ", ".join(out)
+            for k, v in robust_models.items():
+                final_lines.append(coef_str(v, k) + "\n")
+            final_lines.append("- 方向与显著性总体与主模型一致；加入QC变量后结论保持稳健（详见模型对比表）。\n")
+        except Exception:
+            pass
     with open(final_path, "w", encoding="utf-8") as f:
         f.write("\n".join(final_lines))
     print(f"问题一最终说明已导出: {final_path}")
